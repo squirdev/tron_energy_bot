@@ -148,7 +148,7 @@ async def lifespan(app: FastAPI):
     # --- 应用关闭时执行 ---
     logger.info("--- Application shutting down ---")
     if ptb_app:
-        if ptb_app.updater and ptb_app.updater.is_running:
+        if ptb_app.updater and ptb_app.updater.running:
             logger.info("Stopping bot polling...")
             await ptb_app.updater.stop()
         if ptb_app.running:

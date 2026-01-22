@@ -141,10 +141,14 @@ def build_smart_trx_order_keyboard(order_id: str, current_currency: str) -> Inli
 
 def build_customer_service_keyboard() -> InlineKeyboardMarkup:
     """
-    创建一个包含“联系客服”链接按钮的内联键盘。
+    创建一个包含"联系客服"链接按钮的内联键盘。
     """
     # 从 settings 中读取客服链接，如果不存在则使用默认值
-    customer_service_url = getattr(settings, 'CUSTOMER_SERVICE_URL', 'https://t.me/wannm18')
+    customer_service_url = getattr(settings, 'CUSTOMER_SERVICE_URL', 'https://t.me/happySea0001')
+    
+    # 确保 URL 是有效的格式
+    if not customer_service_url or not (customer_service_url.startswith('http://') or customer_service_url.startswith('https://') or customer_service_url.startswith('tg://')):
+        customer_service_url = 'https://t.me/happySea0001'  # 使用默认值
     
     keyboard = [
         [

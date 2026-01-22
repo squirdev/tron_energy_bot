@@ -22,6 +22,7 @@ from app.bot.utils import clear_pending_actions, reply, cancel_conversation
 from app.bot import constants as const
 from app.core.config import settings
 from app.bot.utils import cleanup_order_message
+from app.db.models import Order, OrderType, OrderStatus
 
 # --- "智能笔数" 购买会话 ---
 
@@ -62,15 +63,55 @@ async def smart_trx_size_selected(
 ) -> int:
     """(入口) 用户选择了笔数套餐，现在请求输入接收地址"""
     query = update.callback_query
-    await query.answer()
+    
+    try:
+        await query.answer()
+        
+        size = int(query.data.split(":")[1])
+        context.user_data["smart_trx_size"] = size
 
-    size = int(query.data.split(":")[1])
-    context.user_data["smart_trx_size"] = size
+        price_trx = settings.ENERGY_SMART_PRICE
+        price_usdt = settings.ENERGY_SMART_PRICE_USDT
+        total_trx = size * price_trx
+        total_usdt = size * price_usdt
 
-    text = "请输入能量接收地址(请确认地址已激活):"
+        text = textwrap.dedent(
+            f"""
+            ✅ 您选择了 **{size}笔** 套餐
+            
+            💰 价格信息：
+            • TRX: {total_trx:.2f} TRX ({price_trx:.2f} TRX/笔)
+            • USDT: {total_usdt:.2f} USDT ({price_usdt:.2f} USDT/笔)
+            
+            📝 请输入能量接收地址（请确认地址已激活）：
+            
+            💡 提示：发送 /cancel 可以取消订单
+            """
+        )
 
-    await query.edit_message_text(text)
-    return RECEIVE_SMART_TRX_ADDRESS
+        try:
+            await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN)
+        except Exception as edit_error:
+            # 如果编辑消息失败（例如消息太旧），发送新消息
+            logging.warning(f"编辑消息失败，改为发送新消息: {edit_error}")
+            try:
+                await query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+            except Exception as reply_error:
+                logging.error(f"发送新消息也失败: {reply_error}")
+                await query.answer("❌ 操作失败，请重试", show_alert=True)
+                return ConversationHandler.END
+        
+        logging.info(f"用户 {update.effective_user.id} 选择了 {size}笔 套餐，等待输入地址")
+        return RECEIVE_SMART_TRX_ADDRESS
+        
+    except Exception as e:
+        logging.error(f"处理智能笔数套餐选择时出错: {e}", exc_info=True)
+        try:
+            await query.answer("❌ 处理失败，请重试", show_alert=True)
+            await query.edit_message_text("❌ 处理失败，请重新选择套餐。")
+        except:
+            pass
+        return ConversationHandler.END
 
 
 async def smart_trx_address_received(
@@ -81,9 +122,12 @@ async def smart_trx_address_received(
 
     if not receiver_address.startswith("T") or len(receiver_address) != 34:
         await update.message.reply_text(
-            "地址格式不正确，请重新发送一个T开头的TRON地址。"
+            "❌ 地址格式不正确，请重新发送一个T开头的TRON地址（34个字符）。\n\n"
+            "💡 提示：发送 /cancel 可以取消订单"
         )
         return RECEIVE_SMART_TRX_ADDRESS
+    
+    logging.info(f"用户 {update.effective_user.id} 输入了接收地址: {receiver_address[:10]}...")
 
     size = context.user_data["smart_trx_size"]
 
@@ -123,18 +167,40 @@ async def generate_and_send_order_message(
         currency_unit = "USDT"
 
     payment_address = settings.ENERGY_SMART_ADDRESS
-    expiration_time = datetime.now() + timedelta(minutes=30)
+    expiration_time = datetime.utcnow() + timedelta(minutes=30)
     expiration_str = expiration_time.strftime("%Y-%m-%d %H:%M:%S")
 
     order_id = f"smart_{update.effective_user.id}_{int(datetime.now().timestamp())}"
 
+    # Save order to database for payment detection
+    try:
+        new_order = Order(
+            order_id=order_id,
+            user_id=update.effective_user.id,
+            chat_id=update.effective_chat.id,
+            order_type=OrderType.SMART_TRX,
+            currency=currency,
+            expected_amount=total_amount,
+            expires_at=expiration_time,
+            details={
+                "size": size,
+                "receiver_address": receiver_address,
+                "trx_amount": size * price_per_trx,
+                "usdt_amount": size * price_per_usdt
+            }
+        )
+        await new_order.insert()
+        logging.info(f"创建智能笔数订单 {order_id}: {size}笔, {currency}, {total_amount}")
+    except Exception as e:
+        logging.error(f"保存智能笔数订单失败: {e}", exc_info=True)
+        # Continue anyway, but payment detection won't work
+
+    # Also store in context for currency switching
     context.chat_data[order_id] = {
         "size": size,
         "receiver_address": receiver_address,
         "trx_amount": size * price_per_trx,
         "usdt_amount": size * price_per_usdt
-        # "trx_amount": (size * price_per_trx) + random_suffix,
-        # "usdt_amount": (size * price_per_usdt) + random_suffix,
     }
 
     # 能量代理地址：<code>{receiver_address}</code>
@@ -173,10 +239,36 @@ async def switch_currency_callback(
 
     _, order_id, new_currency = query.data.split(":")
 
-    order_data = context.chat_data.get(order_id)
-    if not order_data:
-        await query.edit_message_text("订单信息已过期，请重新发起购买。")
-        return
+    # Try to get order data from database first, fallback to context
+    order = await Order.find_one(Order.order_id == order_id)
+    if order and order.status == OrderStatus.PENDING_PAYMENT:
+        order_data = {
+            "size": order.details.get("size"),
+            "receiver_address": order.details.get("receiver_address"),
+            "trx_amount": order.details.get("trx_amount"),
+            "usdt_amount": order.details.get("usdt_amount")
+        }
+        # Update order currency and amount in database
+        price_per_trx = settings.ENERGY_SMART_PRICE
+        price_per_usdt = settings.ENERGY_SMART_PRICE_USDT
+        size = order_data["size"]
+        
+        if new_currency == "TRX":
+            new_amount = size * price_per_trx
+        else:  # USDT
+            random_suffix = random.randint(1000, 9999) / 10000.0
+            new_amount = (size * price_per_usdt) + random_suffix
+        
+        order.currency = new_currency
+        order.expected_amount = new_amount
+        await order.save()
+        logging.info(f"订单 {order_id} 切换币种为 {new_currency}, 新金额: {new_amount}")
+    else:
+        # Fallback to context data
+        order_data = context.chat_data.get(order_id)
+        if not order_data:
+            await query.edit_message_text("订单信息已过期，请重新发起购买。")
+            return
 
     await generate_and_send_order_message(
         update,

@@ -47,9 +47,27 @@ class EnergyService:
     @staticmethod
     async def delegate_special_offer_energy(order: Order) -> (bool, str):
         """
-        为“特价能量”订单调用 kuaizu.io API 发放能量。
+        为"特价能量"订单调用 kuaizu.io API 发放能量。
         自动将能量租给支付该订单的地址。
+        注意：在测试网模式下，kuaizu.io 不支持，将返回模拟成功消息。
         """
+        # 如果是测试网，跳过 kuaizu.io API 调用（不支持测试网）
+        if settings.TRON_NETWORK.lower() == "testnet":
+            logging.warning(f"测试网模式：跳过 kuaizu.io API 调用（订单 {order.order_id}）")
+            if not order.payment_txid:
+                return False, "订单处理失败：无法确认付款交易。"
+            receiver_address = await TronService.get_sender_from_txid(order.payment_txid)
+            if not receiver_address:
+                return False, "订单处理失败：无法解析付款方地址。"
+            # 返回模拟成功消息（测试网模式）
+            success_message = (
+                f"🎉 [测试网模式] 能量已模拟到账！\n\n"
+                f"**接收地址:** `{receiver_address}`\n"
+                f"**租赁数量:** 65,000 能量（模拟）\n"
+                f"**注意:** 这是测试网模式，kuaizu.io 不支持测试网，能量未实际发放。"
+            )
+            return True, success_message
+        
         # --- 关键修改：不再从 details 获取，而是通过 txid 查询 ---
         if not order.payment_txid:
             logging.error(f"特价能量订单 {order.order_id} 缺少 payment_txid！")

@@ -21,8 +21,11 @@ async def payment_polling_worker(ptb_app: Application):
     """
     logging.info("--- Payment Polling Worker Started ---")
 
+    # Map addresses to currencies they accept
+    # Note: ENERGY_SMART_ADDRESS accepts both TRX and USDT, we check both in the loop
     addresses_to_scan: Dict[str, str] = {
-        settings.SPECIAL_OFFER_ADDRESS: "TRX"
+        settings.SPECIAL_OFFER_ADDRESS: "TRX",
+        settings.ENERGY_SMART_ADDRESS: "TRX",  # Primary currency, but we also check USDT
     }
 
     while True:
@@ -63,6 +66,8 @@ async def payment_polling_worker(ptb_app: Application):
                 if not new_transactions:
                     continue
                 
+                logging.debug(f"支付监听器在地址 {address[:10]}... 找到 {len(new_transactions)} 笔新交易")
+                
                 latest_tx_timestamp_in_batch = last_timestamp
 
                 for tx in new_transactions:
@@ -74,42 +79,64 @@ async def payment_polling_worker(ptb_app: Application):
                         if tx.timestamp > latest_tx_timestamp_in_batch:
                             latest_tx_timestamp_in_batch = tx.timestamp
 
-                        if tx.token_symbol == currency:
-                            amount_buffer = 0.000001
+                        # Check if transaction matches any pending order for this address
+                        # Handle both TRX and USDT payments (especially for smart transaction orders)
+                        amount_buffer = 0.000001
+                        
+                        # For smart transaction address, check both TRX and USDT orders
+                        # For other addresses, only check the expected currency
+                        if address == settings.ENERGY_SMART_ADDRESS:
+                            # Smart transaction orders can be paid with TRX or USDT
                             matching_order = await Order.find_one(
                                 Order.status == OrderStatus.PENDING_PAYMENT,
                                 Order.currency == tx.token_symbol,
                                 Order.expected_amount > tx.amount - amount_buffer,
                                 Order.expected_amount < tx.amount + amount_buffer,
                             )
-
-                            if matching_order:
-                                matching_order.status = OrderStatus.PAID
-                                matching_order.payment_txid = tx.tx_id
-                                matching_order.paid_amount = tx.amount
-                                matching_order.paid_at = datetime.utcnow()
-                                await matching_order.save()
-                                logging.info(f"订单 {matching_order.order_id} 支付成功！TxID: {tx.tx_id}")
-                                
-                                success_message = f"✅ 支付成功！\n您的订单({matching_order.order_type.value})已确认，正在为您处理..."
-                                try:
-                                    await ptb_app.bot.send_message(chat_id=matching_order.chat_id, text=success_message)
-                                except Exception as e:
-                                    logging.error(f"发送支付成功通知失败 (User: {matching_order.user_id}): {e}")
-                                
-                                # 将已支付的订单对象和 bot 实例传递给 EnergyService 进行处理
-                                await EnergyService.process_paid_order(matching_order, ptb_app)
-                                
-                                break
-                            else:
-                                # --- 金额不匹配！ ---
-                                # 在这里，我们可以查找是否有金额范围部分匹配的订单，
-                                # 以便给用户更友好的提示。
-                                # 例如，用户可能忘记了输入小数。
-                                logging.warning(
-                                    f"收到一笔金额为 {tx.amount} {tx.token_symbol} 的新交易 (TxID: {tx.tx_id[:10]}...), "
-                                    f"但在待支付订单中找不到完全匹配的金额。"
-                                )
+                        elif tx.token_symbol == currency:
+                            # For other addresses, only match if currency matches
+                            matching_order = await Order.find_one(
+                                Order.status == OrderStatus.PENDING_PAYMENT,
+                                Order.currency == tx.token_symbol,
+                                Order.expected_amount > tx.amount - amount_buffer,
+                                Order.expected_amount < tx.amount + amount_buffer,
+                            )
+                        else:
+                            matching_order = None
+                        
+                        if matching_order:
+                            matching_order.status = OrderStatus.PAID
+                            matching_order.payment_txid = tx.tx_id
+                            matching_order.paid_amount = tx.amount
+                            matching_order.paid_at = datetime.utcnow()
+                            await matching_order.save()
+                            logging.info(f"订单 {matching_order.order_id} 支付成功！TxID: {tx.tx_id}")
+                            
+                            success_message = f"✅ 支付成功！\n您的订单({matching_order.order_type.value})已确认，正在为您处理..."
+                            try:
+                                await ptb_app.bot.send_message(chat_id=matching_order.chat_id, text=success_message)
+                            except Exception as e:
+                                logging.error(f"发送支付成功通知失败 (User: {matching_order.user_id}): {e}")
+                            
+                            # 将已支付的订单对象和 bot 实例传递给 EnergyService 进行处理
+                            await EnergyService.process_paid_order(matching_order, ptb_app)
+                            
+                            break
+                        else:
+                            # --- 金额不匹配！ ---
+                            # 在这里，我们可以查找是否有金额范围部分匹配的订单，
+                            # 以便给用户更友好的提示。
+                            # 例如，用户可能忘记了输入小数。
+                            # 查询所有待支付订单以便调试
+                            pending_orders = await Order.find(
+                                Order.status == OrderStatus.PENDING_PAYMENT,
+                                Order.currency == tx.token_symbol
+                            ).to_list()
+                            expected_amounts = [o.expected_amount for o in pending_orders]
+                            logging.warning(
+                                f"收到一笔金额为 {tx.amount} {tx.token_symbol} 的新交易 (TxID: {tx.tx_id[:10]}...), "
+                                f"但在待支付订单中找不到完全匹配的金额。待支付订单金额: {expected_amounts}"
+                            )
 
                 if latest_tx_timestamp_in_batch > last_timestamp:
                     process_state.last_processed_timestamp = latest_tx_timestamp_in_batch

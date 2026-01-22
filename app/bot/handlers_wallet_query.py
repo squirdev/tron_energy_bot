@@ -15,6 +15,7 @@ from app.bot import constants as const
 from app.bot.utils import clear_pending_actions, reply, cancel_conversation
 from app.services.tron_service import TronService
 from app.bot.keyboards import build_monitor_this_address_keyboard
+from app.core.config import settings
 
 # --- "钱包查询" 会话 ---
 
@@ -45,27 +46,54 @@ async def wallet_query_address_received(update: Update, context: ContextTypes.DE
 
     # 地址格式正确，开始查询
     wait_message = await reply(update, f"正在查询地址 `{address}` 的信息...", parse_mode="Markdown")
-    details = await TronService.get_account_details(address)
+    
+    try:
+        details = await TronService.get_account_details(address)
 
-    if details:
-        active_time_str = details.last_operation_time.strftime("%Y-%m-%d %H:%M:%S")
-        create_time_str = details.creation_time.strftime("%Y-%m-%d %H:%M:%S")
-        query_result_text = textwrap.dedent(f"""
-        `{details.address}`
-        ——————————资源——————————
-        TRX余额:{details.trx_balance}
-        USDT余额:{details.usdt_balance}
-        能量: {details.energy_used} / {details.energy_limit}
-        质押资产: {details.total_staked}
-        免费带宽: {details.net_used} / {details.net_limit}
-        质押带宽: {details.staked_bandwidth_used} / {details.staked_bandwidth_limit}
-        活跃时间: {active_time_str}
-        创建时间: {create_time_str}
-        """)
-        keyboard = build_monitor_this_address_keyboard(address)
-        await wait_message.edit_text(query_result_text, reply_markup=keyboard, parse_mode="Markdown")
-    else:
-        await wait_message.edit_text("查询失败，地址可能未激活或网络错误。")
+        if details:
+            active_time_str = details.last_operation_time.strftime("%Y-%m-%d %H:%M:%S")
+            create_time_str = details.creation_time.strftime("%Y-%m-%d %H:%M:%S")
+            query_result_text = textwrap.dedent(f"""
+            `{details.address}`
+            ——————————资源——————————
+            TRX余额:{details.trx_balance}
+            USDT余额:{details.usdt_balance}
+            能量: {details.energy_used} / {details.energy_limit}
+            质押资产: {details.total_staked}
+            免费带宽: {details.net_used} / {details.net_limit}
+            质押带宽: {details.staked_bandwidth_used} / {details.staked_bandwidth_limit}
+            活跃时间: {active_time_str}
+            创建时间: {create_time_str}
+            """)
+            try:
+                keyboard = build_monitor_this_address_keyboard(address)
+                await wait_message.edit_text(query_result_text, reply_markup=keyboard, parse_mode="Markdown")
+            except Exception as kb_error:
+                # 如果编辑消息失败，尝试发送新消息
+                logging.warning(f"Failed to edit message with keyboard: {kb_error}, sending new message")
+                await reply(update, query_result_text, reply_markup=keyboard, parse_mode="Markdown")
+        else:
+            # 提供更详细的错误信息
+            network_mode = "测试网" if settings.TRON_NETWORK.lower() == "testnet" else "主网"
+            error_msg = (
+                f"❌ 查询失败\n\n"
+                f"**可能的原因：**\n"
+                f"1. 地址未激活（从未收到过任何交易）\n"
+                f"2. 网络不匹配（当前为{network_mode}，地址可能属于另一个网络）\n"
+                f"3. TronGrid API 暂时不可用\n\n"
+                f"**当前网络：** {network_mode}\n"
+                f"**地址：** `{address}`\n\n"
+                f"💡 提示：请检查地址是否属于当前网络，或查看控制台日志获取详细错误信息。"
+            )
+            await wait_message.edit_text(error_msg, parse_mode="Markdown")
+    except Exception as e:
+        logging.error(f"Wallet query error for {address}: {e}", exc_info=True)
+        error_msg = (
+            f"❌ 查询时发生错误\n\n"
+            f"**错误信息：** {str(e)}\n\n"
+            f"请检查控制台日志获取详细信息，或稍后重试。"
+        )
+        await wait_message.edit_text(error_msg, parse_mode="Markdown")
 
     # --- 关键修改：查询成功后，结束会话 ---
     return ConversationHandler.END

@@ -50,7 +50,13 @@ class BalanceMonitorService:
 async def balance_monitor_worker(ptb_app: Application):
     """
     后台任务，定期检查 kuaizu.io 余额，余额不足时通知管理员（仅通知一次）
+    注意：在测试网模式下，此监控会被跳过（kuaizu.io 不支持测试网）
     """
+    # 如果是测试网，跳过余额监控（kuaizu.io 只支持主网）
+    if settings.TRON_NETWORK.lower() == "testnet":
+        logging.info("--- Balance Monitor Worker Skipped (Testnet mode - kuaizu.io only supports mainnet) ---")
+        return
+    
     logging.info("--- Balance Monitor Worker Started ---")
 
     while True:

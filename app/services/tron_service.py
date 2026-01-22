@@ -3,6 +3,7 @@ from datetime import datetime
 from pydantic import BaseModel
 import asyncio
 import httpx
+import requests  # For synchronous USDT balance query
 from typing import Optional, List 
 # --- 导入 Tronpy ---
 from tronpy import Tron
@@ -53,7 +54,7 @@ class TronService:
         testnet_url = settings.TRON_TESTNET_ENDPOINT or "https://api.shasta.trongrid.io"
         provider = HTTPProvider(testnet_url, api_key=settings.TRONGRID_API_KEY)
         client = Tron(network="shasta", provider=provider, conf={"fee_limit": 0})
-        USDT_CONTRACT_ADDRESS = "TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf"  # Shasta testnet USDT
+        USDT_CONTRACT_ADDRESS = "TG3XXyExBkPp9nzdajDZsozEu4BkaSJozs"  # Shasta testnet USDT
         logging.info(f"TronService initialized for TESTNET (Shasta) - Endpoint: {testnet_url}")
     else:
         # 主网配置 (Mainnet)
@@ -76,15 +77,52 @@ class TronService:
         def _sync_fetch_details():
             """这个内部函数包含了所有同步的 tronpy 调用。"""
             # 1. 获取账户基本信息 (TRX余额, 创建/活跃时间, 质押等)
-            account_info = TronService.client.get_account(address)
+            try:
+                account_info = TronService.client.get_account(address)
+            except Exception as e:
+                logging.error(f"Failed to get account info for {address}: {e}")
+                raise
 
             # 2. 获取账户资源信息 (能量和带宽)
-            resources = TronService.client.get_account_resource(address)
+            try:
+                resources = TronService.client.get_account_resource(address)
+            except Exception as e:
+                logging.warning(f"Failed to get account resources for {address}: {e}, using defaults")
+                resources = {
+                    "EnergyLimit": 0,
+                    "EnergyUsed": 0,
+                    "freeNetLimit": 5000,
+                    "freeNetUsed": 0,
+                    "NetLimit": 0,
+                    "NetUsed": 0
+                }
 
-            # 3. 获取USDT余额
-            contract = TronService.client.get_contract(TronService.USDT_CONTRACT_ADDRESS)
-            usdt_raw_balance = contract.functions.balanceOf(address)
-            usdt_balance = usdt_raw_balance / (10**TronService.USDT_DECIMALS)
+            # 3. 获取USDT余额 - 使用 requests 库（同步）而不是 tronpy 合约调用（避免 ABI 问题）
+            try:
+                # 使用 TronGrid API 直接查询 TRC20 余额，避免需要 ABI
+                # Use correct endpoint based on network mode
+                if TronService._is_testnet:
+                    base_url = "https://api.shasta.trongrid.io"
+                else:
+                    base_url = "https://api.trongrid.io"
+                trc20_url = f"{base_url}/v1/accounts/{address}/tokens"
+                headers = {"TRON-PRO-API-KEY": settings.TRONGRID_API_KEY} if settings.TRONGRID_API_KEY else {}
+                params = {"contract_address": TronService.USDT_CONTRACT_ADDRESS}
+                
+                response = requests.get(trc20_url, headers=headers, params=params, timeout=10)
+                response.raise_for_status()
+                data = response.json()
+                
+                # 查找 USDT token
+                usdt_balance = 0.0
+                if "data" in data and len(data["data"]) > 0:
+                    for token in data["data"]:
+                        if token.get("token_address", "").upper() == TronService.USDT_CONTRACT_ADDRESS.upper():
+                            usdt_balance = float(token.get("balance", 0)) / (10**TronService.USDT_DECIMALS)
+                            break
+            except Exception as e:
+                logging.warning(f"Failed to get USDT balance for {address}: {e}, using 0")
+                usdt_balance = 0.0
 
             # 4. 汇总质押信息 (能量和带宽)
             total_staked = 0
@@ -134,10 +172,19 @@ class TronService:
     async def get_new_transactions(address: str, since_timestamp: int) -> List[TransactionData]:
         """
         [重构] 使用 TronGrid 的免费 V1 API 获取一个地址在指定时间戳之后的新交易。
+        支持主网和测试网。
         """
         all_new_transactions = []
-        base_url = "https://api.trongrid.io/v1/accounts"
+        # 根据网络模式选择正确的 API 端点
+        if TronService._is_testnet:
+            base_url = "https://api.shasta.trongrid.io/v1/accounts"
+            network_name = "Shasta Testnet"
+        else:
+            base_url = "https://api.trongrid.io/v1/accounts"
+            network_name = "Mainnet"
         headers = {"TRON-PRO-API-KEY": settings.TRONGRID_API_KEY} # 假设 API Key 存储在 settings 中
+        
+        logging.debug(f"查询 {network_name} 交易: 地址={address[:10]}..., 时间戳>={since_timestamp}")
         
         # 为了避免错过交易，我们给时间戳一个小的缓冲
         # "only_confirmed": True 移除 only_confirmed 意味着您可能会获取到一些最终因为分叉等原因未被区块链接受的交易。虽然在 TRON 上这种情况非常罕见，但理论上存在。
@@ -226,7 +273,13 @@ class TronService:
         logging.info(f"[get_new_transactions] 正在为地址 {address} 查询时间戳 > {since_timestamp} 的交易...")
         
         all_new_transactions = []
-        base_url = "https://api.trongrid.io/v1/accounts"
+        # Use correct endpoint based on network mode
+        if TronService._is_testnet:
+            base_url = "https://api.shasta.trongrid.io/v1/accounts"
+            network_name = "Shasta Testnet"
+        else:
+            base_url = "https://api.trongrid.io/v1/accounts"
+            network_name = "Mainnet"
         headers = {"TRON-PRO-API-KEY": settings.TRONGRID_API_KEY}
         
         params = {"limit": 20, "min_timestamp": since_timestamp}

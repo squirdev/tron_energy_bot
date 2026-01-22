@@ -1,6 +1,7 @@
 import logging
 import textwrap
-import random 
+import random
+import asyncio
 from datetime import datetime, timedelta 
 from telegram import Update
 from telegram.ext import ContextTypes, ApplicationHandlerStop
@@ -180,8 +181,44 @@ async def handle_trx_exchange(
         有任何问题,请私聊联系老板,双向用户可以私聊机器人
     """
     )
-    keyboard = keyboards.build_customer_service_keyboard()
-    await reply(update, response_text, reply_markup=keyboard)
+    inline_keyboard = keyboards.build_customer_service_keyboard()
+    main_keyboard = keyboards.get_main_keyboard()
+    
+    # Send message with inline keyboard
+    # Then send a message with reply keyboard to preserve the menu buttons
+    if update.message:
+        await update.message.reply_text(
+            text=response_text,
+            parse_mode="HTML",
+            reply_markup=inline_keyboard
+        )
+        # Send a message with reply keyboard to preserve menu buttons
+        # Use a minimal text that won't be too intrusive
+        preserve_msg = await update.message.reply_text(
+            text=" ",  # Single space character (minimal visible text)
+            reply_markup=main_keyboard
+        )
+        # Delete the preservation message after a short delay to keep UI clean
+        try:
+            await asyncio.sleep(0.2)
+            await preserve_msg.delete()
+        except Exception:
+            pass  # If deletion fails, that's okay - the keyboard is already set
+    else:
+        await update.effective_chat.send_message(
+            text=response_text,
+            parse_mode="HTML",
+            reply_markup=inline_keyboard
+        )
+        preserve_msg = await update.effective_chat.send_message(
+            text=" ",
+            reply_markup=main_keyboard
+        )
+        try:
+            await asyncio.sleep(0.2)
+            await preserve_msg.delete()
+        except Exception:
+            pass
     raise ApplicationHandlerStop
 
 
